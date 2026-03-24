@@ -1,5 +1,6 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped
 from cv_bridge import CvBridge
@@ -161,17 +162,17 @@ class ArucoDetectorNode(Node):
         self.sub_info = self.create_subscription(
             CameraInfo,
             '/right_camera/camera/camera/color/camera_info',
-            self._info_cb, 1
+            self._info_cb, qos_profile_sensor_data
         )
         self.sub_depth = self.create_subscription(
             Image,
-            '/right_camera/camera/camera/aligned_depth_to_color/image_raw',
-            self._depth_cb, 1
+            '/right_camera/camera/camera/depth/image_rect_raw',
+            self._depth_cb, qos_profile_sensor_data
         )
         self.sub_image = self.create_subscription(
             Image,
             '/right_camera/camera/camera/color/image_raw',
-            self._image_cb, 1
+            self._image_cb, qos_profile_sensor_data
         )
         self.pub_annotated = self.create_publisher(
             Image, '/aruco/annotated_image', 1
@@ -196,6 +197,11 @@ class ArucoDetectorNode(Node):
 
     def _depth_cb(self, msg):
         self.depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+        if not hasattr(self, '_depth_received'):
+            self._depth_received = True
+            self.get_logger().info(
+                f'First depth frame: shape={self.depth_image.shape} dtype={self.depth_image.dtype}'
+            )
 
     def _deproject_depth(self, corners_2d):
         """Get 3D translation from depth at marker center (3x3 patch median).
@@ -265,13 +271,12 @@ class ArucoDetectorNode(Node):
                     R_ij, _ = cv2.Rodrigues(rvec)
                     t_pnp = tvec.flatten()
 
-                    # Fuse with depth-based translation
+                    # Require depth — skip tag if unavailable
                     t_depth = self._deproject_depth(c[0])
-                    if t_depth is not None:
-                        w = self.DEPTH_WEIGHT
-                        t_fused = w * t_depth + (1 - w) * t_pnp
-                    else:
-                        t_fused = t_pnp
+                    if t_depth is None:
+                        continue
+                    w = self.DEPTH_WEIGHT
+                    t_fused = w * t_depth + (1 - w) * t_pnp
 
                     # Draw marker axes with fused translation
                     rvec_draw = rvec
