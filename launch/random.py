@@ -6,7 +6,11 @@ import cv2
 # --- 1. USER CONFIGURATION ---
 # ==========================================
 
-MARKER_SIZE_METERS = 0.0725
+MARKER_SIZE_METERS = 0.0662
+EXPOSURE_US  = 75     # microseconds. Set to None for auto.
+GAIN         = 80     # RGB gain (0-128, default 64). Set to None for auto.
+CAMERA_FPS   = 30
+DEPTH_UNITS  = 0.0001 # metres per depth unit (0.1 mm resolution, max range ~6.5 m)
 
 
 def build_T(t, R):
@@ -92,20 +96,26 @@ def main():
     pipeline = rs.pipeline()
     config = rs.config()
 
-    config.enable_stream(rs.stream.depth, 1280, 720, rs.format.z16, 30)
-    config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
+    config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, CAMERA_FPS)
+    config.enable_stream(rs.stream.depth, 1280, 720, rs.format.z16, CAMERA_FPS)
 
     print("Starting pipeline...")
     profile = pipeline.start(config)
 
-    # Lock FPS / AE priority off (best-effort)
+    # Lock FPS / AE priority off, set manual exposure & gain
     device = profile.get_device()
     for sensor in device.query_sensors():
-        try:
-            if sensor.get_info(rs.camera_info.name) == "RGB Camera":
-                sensor.set_option(rs.option.auto_exposure_priority, 0)
-        except Exception:
-            pass
+        if sensor.get_info(rs.camera_info.name) == "RGB Camera":
+            sensor.set_option(rs.option.auto_exposure_priority, 0)
+            if EXPOSURE_US is not None:
+                sensor.set_option(rs.option.enable_auto_exposure, 0)
+                sensor.set_option(rs.option.exposure, EXPOSURE_US)
+            if GAIN is not None:
+                sensor.set_option(rs.option.gain, GAIN)
+
+    depth_sensor = profile.get_device().first_depth_sensor()
+    if depth_sensor.supports(rs.option.depth_units):
+        depth_sensor.set_option(rs.option.depth_units, DEPTH_UNITS)
 
     align = rs.align(rs.stream.color)
 

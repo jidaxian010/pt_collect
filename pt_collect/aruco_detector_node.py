@@ -1,6 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import PoseStamped
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
@@ -116,7 +117,7 @@ TAG_TRANSFORMS = {
 
 class ArucoDetectorNode(Node):
 
-    MARKER_SIZE = 0.0725  # 7.25 cm
+    MARKER_SIZE = 0.0662 
 
     # ==================== TUNING PARAMETERS ====================
     DEPTH_WEIGHT = 0.6        # depth vs PnP translation fusion (0=PnP only, 1=depth only)
@@ -177,6 +178,9 @@ class ArucoDetectorNode(Node):
         )
         self.pub_gripper = self.create_publisher(
             Image, '/aruco/gripper_pose_image', 1
+        )
+        self.pub_gripper_pose = self.create_publisher(
+            PoseStamped, '/aruco/gripper_pose', 1
         )
 
         self.smooth_pos = None
@@ -322,6 +326,19 @@ class ArucoDetectorNode(Node):
                 f'x:{smooth_pos[0]:.3f} y:{smooth_pos[1]:.3f} z:{smooth_pos[2]:.3f}',
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
             )
+
+            # Publish gripper pose as PoseStamped
+            pose_msg = PoseStamped()
+            pose_msg.header = msg.header
+            pose_msg.pose.position.x = float(smooth_pos[0])
+            pose_msg.pose.position.y = float(smooth_pos[1])
+            pose_msg.pose.position.z = float(smooth_pos[2])
+            # smooth_quat is [w, x, y, z], ROS uses [x, y, z, w]
+            pose_msg.pose.orientation.x = float(smooth_quat[1])
+            pose_msg.pose.orientation.y = float(smooth_quat[2])
+            pose_msg.pose.orientation.z = float(smooth_quat[3])
+            pose_msg.pose.orientation.w = float(smooth_quat[0])
+            self.pub_gripper_pose.publish(pose_msg)
         else:
             cv2.putText(
                 gripper_frame, 'No markers detected',

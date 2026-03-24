@@ -1,6 +1,6 @@
 from launch import LaunchDescription
 from launch_ros.actions import Node, PushRosNamespace
-from launch.actions import GroupAction, IncludeLaunchDescription
+from launch.actions import GroupAction, IncludeLaunchDescription, ExecuteProcess, TimerAction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from ament_index_python.packages import get_package_share_directory
 import os
@@ -32,6 +32,9 @@ def generate_launch_description():
                     'depth_module.depth_profile': '848x480x30',
                     'rgb_camera.color_format': 'rgb8',
                     'rgb_camera.color_profile': '848x480x30',
+                    'rgb_camera.enable_auto_exposure': 'false',
+                    'rgb_camera.exposure': '75',
+                    'rgb_camera.gain': '80',
 
                     'frames_queue_size': '8',
 
@@ -74,6 +77,9 @@ def generate_launch_description():
                     'depth_module.depth_profile': '848x480x30',
                     'rgb_camera.color_format': 'rgb8',
                     'rgb_camera.color_profile': '1280x720x30',
+                    'rgb_camera.enable_auto_exposure': 'false',
+                    'rgb_camera.exposure': '75',
+                    'rgb_camera.gain': '80',
 
                     # Important for matching RGB/depth frames
                     'enable_sync': 'true',
