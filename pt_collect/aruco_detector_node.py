@@ -6,6 +6,12 @@ from geometry_msgs.msg import PoseStamped
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
+from scipy.spatial.transform import Rotation
+
+from pt_collect.GripperTransforms import (
+    TAG_TRANSFORMS as GT_TAG_TRANSFORMS,
+    MARKER_SIZE_METERS as GT_MARKER_SIZE,
+)
 
 
 def _build_T(t, R):
@@ -76,44 +82,18 @@ def _slerp(q0, q1, alpha):
            (np.sin(alpha * theta) / sin_theta) * q1
 
 
-# Known transforms: marker frame (j) -> gripper frame (k)
-_R_10 = np.array([
-    [0.0, 0.0, 1.0],
-    [0.0, 1.0, 0.0],
-    [-1.0, 0.0, 0.0],
-], dtype=np.float64)
+TAG_TRANSFORMS = GT_TAG_TRANSFORMS
 
-_R_20 = np.array([
-    [0.7071, 0.0, 0.7071],
-    [0.0, 1.0, 0.0],
-    [-0.7071, 0.0, 0.7071],
-], dtype=np.float64)
 
-_R_30 = np.array([
-    [0.0, 0.0, 1.0],
-    [-0.6654, 0.7465, 0.0],
-    [-0.7465, -0.6654, 0.0],
-], dtype=np.float64)
 
-_R_40 = np.array([
-    [-0.7071, 0.0, 0.7071],
-    [0.0, 1.0, 0.0],
-    [-0.7071, 0.0, -0.7071],
-], dtype=np.float64)
-
-_R_50 = np.array([
-    [0.0, 0.0, 1.0],
-    [0.7465, 0.6654, 0.0],
-    [-0.6654, 0.7465, 0.0],
-], dtype=np.float64)
-
-TAG_TRANSFORMS = {
-    1: _build_T(t=[0.3927, 0.0225, -0.2142], R=_R_10),
-    2: _build_T(t=[0.3641, 0.0225, 0.0993], R=_R_20),
-    3: _build_T(t=[0.3927, -0.0592, -0.2003], R=_R_30),
-    4: _build_T(t=[0.1912, 0.0225, -0.4561], R=_R_40),
-    5: _build_T(t=[0.3927, 0.0928, -0.1703], R=_R_50),
-}
+# Marker 3D points for the GripperTransforms method (float32 for solvePnPGeneric)
+_gt_half = GT_MARKER_SIZE / 2.0
+_GT_MARKER_3D = np.array([
+    [-_gt_half,  _gt_half, 0],
+    [ _gt_half,  _gt_half, 0],
+    [ _gt_half, -_gt_half, 0],
+    [-_gt_half, -_gt_half, 0],
+], dtype=np.float32)
 
 
 class ArucoDetectorNode(Node):
@@ -124,7 +104,7 @@ class ArucoDetectorNode(Node):
     DEPTH_WEIGHT = 0.6        # depth vs PnP translation fusion (0=PnP only, 1=depth only)
     EMA_ALPHA = 0.5           # EMA blend factor (0=smooth, 1=reactive)
     OUTLIER_DIST = 0.10       # meters — per-tag outlier rejection vs median
-    MAX_POS_STEP = 0.02       # meters — max position change per frame
+    MAX_POS_STEP = 0.1       # meters — max position change per frame
     MAX_ROT_STEP = 0.1        # radians — max rotation change per frame (~5.7 deg)
     # =============================================================
 
@@ -183,9 +163,17 @@ class ArucoDetectorNode(Node):
         self.pub_gripper_pose = self.create_publisher(
             PoseStamped, '/aruco/gripper_pose', 1
         )
+        self.pub_four = self.create_publisher(
+            Image, '/aruco/gripper_pose_four', 1
+        )
+        self.pub_four_pose = self.create_publisher(
+            PoseStamped, '/aruco/gripper_pose_four_pose', 1
+        )
 
         self.smooth_pos = None
         self.smooth_quat = None
+        self.smooth_four_pos = None
+        self.smooth_four_quat = None
 
         self.get_logger().info('ArUco detector node started')
 
@@ -238,6 +226,71 @@ class ArucoDetectorNode(Node):
         z = depth_m
 
         return np.array([x, y, z], dtype=np.float64)
+
+    def _compute_four_corner_pose(self, corners, ids):
+        """Compute gripper pose using solvePnPGeneric (IPPE) + GripperTransforms.
+        Matches aruco_test.py / RecordImagesAR.py approach exactly.
+        Returns (position, quaternion_wxyz, n_tags) or (None, None, 0)."""
+        if ids is None or self.camera_matrix is None:
+            return None, None, 0
+
+        gripper_poses = []
+
+        for i in range(len(ids)):
+            tag_id = int(ids[i][0])
+            if tag_id not in GT_TAG_TRANSFORMS:
+                continue
+
+            corner_px = corners[i][0]
+
+            _, rvecs, tvecs, _ = cv2.solvePnPGeneric(
+                _GT_MARKER_3D, corner_px,
+                self.camera_matrix, self.dist_coeffs,
+                flags=cv2.SOLVEPNP_IPPE)
+            rvec, tvec = rvecs[0], tvecs[0]
+
+            R_cam_tag, _ = cv2.Rodrigues(rvec)
+            T_cam_tag = np.eye(4)
+            T_cam_tag[:3, :3] = R_cam_tag
+            T_cam_tag[:3, 3] = tvec.flatten()
+            T_cam_grip = T_cam_tag @ GT_TAG_TRANSFORMS[tag_id]
+            gripper_poses.append(T_cam_grip)
+
+        if not gripper_poses:
+            return None, None, 0
+
+        # Fuse across visible tags
+        if len(gripper_poses) == 1:
+            T_grip = gripper_poses[0]
+        else:
+            positions = np.array([T[:3, 3] for T in gripper_poses])
+            quats = [Rotation.from_matrix(T[:3, :3]).as_quat()
+                     for T in gripper_poses]
+
+            # Outlier rejection: if 3+ tags, reject positions far from median
+            if len(positions) >= 3:
+                median = np.median(positions, axis=0)
+                dists = np.linalg.norm(positions - median, axis=1)
+                keep = dists < self.OUTLIER_DIST
+                if np.any(keep):
+                    positions = positions[keep]
+                    quats = [q for q, k in zip(quats, keep) if k]
+
+            avg_pos = np.mean(positions, axis=0)
+            for j in range(1, len(quats)):
+                if np.dot(quats[j], quats[0]) < 0:
+                    quats[j] = -quats[j]
+            avg_q = np.mean(quats, axis=0)
+            avg_q /= np.linalg.norm(avg_q)
+            T_grip = np.eye(4)
+            T_grip[:3, :3] = Rotation.from_quat(avg_q).as_matrix()
+            T_grip[:3, 3] = avg_pos
+
+        # Convert to [w, x, y, z] for internal use
+        q_xyzw = Rotation.from_matrix(T_grip[:3, :3]).as_quat()
+        q_wxyz = np.array([q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]])
+
+        return T_grip[:3, 3].copy(), q_wxyz, len(gripper_poses)
 
     def _image_cb(self, msg):
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -354,6 +407,49 @@ class ArucoDetectorNode(Node):
         gp_msg.header = msg.header
         self.pub_gripper.publish(gp_msg)
 
+        # --- Four-corner depth-based gripper pose ---
+        four_frame = frame.copy()
+        four_pos, four_quat, four_n = self._compute_four_corner_pose(
+            corners, ids
+        )
+
+        if four_pos is not None:
+            s4_pos, s4_quat = self._update_smooth_four(four_pos, four_quat)
+            R4 = _quat_to_rot(s4_quat)
+            rvec4, _ = cv2.Rodrigues(R4)
+            tvec4 = s4_pos.reshape(3, 1)
+
+            cv2.drawFrameAxes(
+                four_frame, self.camera_matrix, self.dist_coeffs,
+                rvec4, tvec4, self.MARKER_SIZE * 1.5,
+            )
+            cv2.putText(
+                four_frame,
+                f'Four  tags:{four_n}  '
+                f'x:{s4_pos[0]:.3f} y:{s4_pos[1]:.3f} z:{s4_pos[2]:.3f}',
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 0), 2,
+            )
+
+            pose4 = PoseStamped()
+            pose4.header = msg.header
+            pose4.pose.position.x = float(s4_pos[0])
+            pose4.pose.position.y = float(s4_pos[1])
+            pose4.pose.position.z = float(s4_pos[2])
+            pose4.pose.orientation.x = float(s4_quat[1])
+            pose4.pose.orientation.y = float(s4_quat[2])
+            pose4.pose.orientation.z = float(s4_quat[3])
+            pose4.pose.orientation.w = float(s4_quat[0])
+            self.pub_four_pose.publish(pose4)
+        else:
+            cv2.putText(
+                four_frame, 'No markers detected',
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2,
+            )
+
+        f4_msg = self.bridge.cv2_to_imgmsg(four_frame, encoding='bgr8')
+        f4_msg.header = msg.header
+        self.pub_four.publish(f4_msg)
+
     def _fuse_gripper_pose(self, positions, rotations):
         """Median-filter outlier tags, return fused (position, quaternion, count)."""
         if not positions:
@@ -413,6 +509,33 @@ class ArucoDetectorNode(Node):
             self.smooth_quat = target_quat
 
         return self.smooth_pos, self.smooth_quat
+
+    def _update_smooth_four(self, raw_pos, raw_quat):
+        """Apply EMA smoothing with clamped max step for four-corner pose."""
+        if self.smooth_four_pos is None:
+            self.smooth_four_pos = raw_pos.copy()
+            self.smooth_four_quat = raw_quat.copy()
+            return self.smooth_four_pos, self.smooth_four_quat
+
+        alpha = self.EMA_ALPHA
+        target_pos = alpha * raw_pos + (1 - alpha) * self.smooth_four_pos
+        target_quat = _slerp(self.smooth_four_quat, raw_quat, alpha)
+
+        delta_pos = target_pos - self.smooth_four_pos
+        pos_step = np.linalg.norm(delta_pos)
+        if pos_step > self.MAX_POS_STEP:
+            delta_pos = delta_pos * (self.MAX_POS_STEP / pos_step)
+        self.smooth_four_pos = self.smooth_four_pos + delta_pos
+
+        dot = np.clip(np.abs(np.dot(self.smooth_four_quat, target_quat)), 0.0, 1.0)
+        rot_step = 2.0 * np.arccos(dot)
+        if rot_step > self.MAX_ROT_STEP:
+            frac = self.MAX_ROT_STEP / rot_step
+            self.smooth_four_quat = _slerp(self.smooth_four_quat, target_quat, frac)
+        else:
+            self.smooth_four_quat = target_quat
+
+        return self.smooth_four_pos, self.smooth_four_quat
 
 
 def main(args=None):
